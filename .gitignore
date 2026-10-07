@@ -1,0 +1,10 @@
+# Temporary & cache files
+*.tmp
+*.log
+*.bak
+*~
+Thumbs.db
+Desktop.ini
+
+# Machine-specific pre-optimization state snapshot
+PreOptimizationState.json
