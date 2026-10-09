@@ -60,6 +60,28 @@ if (-not $isAdmin) {
     exit 1
 }
 
+# 全局可靠探测 nvidia-smi 路径
+function Get-NvidiaSmiPath {
+    $cmd = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    $cmd2 = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+    if ($cmd2 -and (Test-Path $cmd2.Source)) { return $cmd2.Source }
+    $candidates = @(
+        "$env:SystemRoot\System32\nvidia-smi.exe",
+        "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        "$env:SystemDrive\Windows\System32\nvidia-smi.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    $driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
+    if (Test-Path $driverStore) {
+        $nvsmiInStore = Get-ChildItem -Path $driverStore -Filter "nvidia-smi.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($nvsmiInStore) { return $nvsmiInStore.FullName }
+    }
+    return $null
+}
+
 function Get-RegValSafe ($path, $name) {
     if (Test-Path $path) {
         $prop = Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue
@@ -257,14 +279,52 @@ function Save-PreOptimizationSnapshot {
         
         $tcpShow = netsh int tcp show global 2>$null
         $gTcp = @{}
+        $cTcp = @{
+            rss = $null
+            autotuninglevel = $null
+            ecncapability = $null
+            timestamps = $null
+            congestionprovider = $null
+        }
         if ($tcpShow) {
             foreach ($line in ($tcpShow -split "`r?`n")) {
                 if ($line -match '^\s*([^:]+?)\s*:\s*(.+)$') {
-                    $gTcp[$matches[1].Trim()] = $matches[2].Trim()
+                    $key = $matches[1].Trim()
+                    $val = $matches[2].Trim()
+                    $gTcp[$key] = $val
+                    if ($key -match 'Receive-Side|接收.*缩放') { $cTcp.rss = $val }
+                    elseif ($key -match 'Auto-Tuning|自动调节') { $cTcp.autotuninglevel = $val }
+                    elseif ($key -match 'ECN') { $cTcp.ecncapability = $val }
+                    elseif ($key -match 'Timestamp|时间戳') { $cTcp.timestamps = $val }
+                    elseif ($key -match 'Congestion|拥塞控制') { $cTcp.congestionprovider = $val }
                 }
             }
         }
         $snapshot.Network.GlobalTcp = $gTcp
+        $snapshot.Network.CanonicalTcp = $cTcp
+
+        # 抓取网卡 Class 驱动级参数 (防止底层覆盖后无法还原)
+        $nicClassKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
+        $nicClassList = [System.Collections.Generic.List[object]]::new()
+        if (Test-Path $nicClassKey) {
+            Get-ChildItem -Path $nicClassKey -ErrorAction SilentlyContinue | ForEach-Object {
+                $subKey = $_.PSPath
+                if (Get-ItemProperty -Path $subKey -Name "DriverDesc" -ErrorAction SilentlyContinue) {
+                    $keysToSave = @("*FlowControl", "*LsoV2IPv4", "*LsoV2IPv6", "*EEE", "*AdvancedEEE", "*GreenEthernet", "PowerSavingMode")
+                    $vals = @{}
+                    foreach ($k in $keysToSave) {
+                        $vals[$k] = Get-RegValSafe $subKey $k
+                    }
+                    $nicClassList.Add(@{
+                        Path = $subKey
+                        SubKeyName = $_.PSChildName
+                        DriverDesc = (Get-ItemProperty -Path $subKey -Name "DriverDesc" -ErrorAction SilentlyContinue).DriverDesc
+                        Values = $vals
+                    })
+                }
+            }
+        }
+        $snapshot.Network.NicClassSettings = $nicClassList.ToArray()
 
         $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue
         $adList = [System.Collections.Generic.List[object]]::new()
@@ -368,13 +428,29 @@ function Save-PreOptimizationSnapshot {
             $snapshot.SystemBackground.SysMainStatus = $sysMain.Status.ToString()
         }
 
-        # 保存全局变量并写入文件
-        $global:PreOptimizationSnapshot = $snapshot
         $targetDir = "$env:ProgramData\UniversalGameOptimizer"
         if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
-        
-        $jsonStr = $snapshot | ConvertTo-Json -Depth 6
         $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } elseif ([System.AppDomain]::CurrentDomain.BaseDirectory) { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') } else { (Get-Location).Path }
+
+        # 初始基线永久保护机制 (防二次运行将已优化状态当成出厂基准覆盖)
+        $progDataBaseline = "$targetDir\PreOptimizationState.baseline.json"
+        $scriptBaseline = Join-Path $scriptDir "PreOptimizationState.baseline.json"
+        $flagFile = "$targetDir\OptimizationCompleted.flag"
+        $isSubsequentRun = (Test-Path $flagFile) -or (Test-Path $progDataBaseline) -or (Test-Path $scriptBaseline)
+
+        if (-not $isSubsequentRun) {
+            $snapshot.IsBaselineSnapshot = $true
+            $jsonBase = $snapshot | ConvertTo-Json -Depth 6
+            [System.IO.File]::WriteAllText($progDataBaseline, $jsonBase, [System.Text.Encoding]::UTF8)
+            [System.IO.File]::WriteAllText($scriptBaseline, $jsonBase, [System.Text.Encoding]::UTF8)
+            Print-Success "已成功建立并永久锁定【系统初始纯净基准快照】：[PreOptimizationState.baseline.json]"
+        } else {
+            Print-Info "检测到初始纯净基线已存在，系统处于受保状态，绝不覆盖优化前原始状态 [PreOptimizationState.baseline.json]！"
+        }
+
+        # 保存全局变量并写入当前会话快照
+        $global:PreOptimizationSnapshot = $snapshot
+        $jsonStr = $snapshot | ConvertTo-Json -Depth 6
         [System.IO.File]::WriteAllText("$targetDir\PreOptimizationState.json", $jsonStr, [System.Text.Encoding]::UTF8)
         [System.IO.File]::WriteAllText((Join-Path $scriptDir "PreOptimizationState.json"), $jsonStr, [System.Text.Encoding]::UTF8)
 
@@ -392,6 +468,10 @@ function Save-SnapshotStateToDisk {
             if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
             $jsonStr = $global:PreOptimizationSnapshot | ConvertTo-Json -Depth 6
             $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } elseif ([System.AppDomain]::CurrentDomain.BaseDirectory) { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') } else { (Get-Location).Path }
+            if (-not (Test-Path "$targetDir\PreOptimizationState.baseline.json")) {
+                [System.IO.File]::WriteAllText("$targetDir\PreOptimizationState.baseline.json", $jsonStr, [System.Text.Encoding]::UTF8)
+                [System.IO.File]::WriteAllText((Join-Path $scriptDir "PreOptimizationState.baseline.json"), $jsonStr, [System.Text.Encoding]::UTF8)
+            }
             [System.IO.File]::WriteAllText("$targetDir\PreOptimizationState.json", $jsonStr, [System.Text.Encoding]::UTF8)
             [System.IO.File]::WriteAllText((Join-Path $scriptDir "PreOptimizationState.json"), $jsonStr, [System.Text.Encoding]::UTF8)
         }
@@ -421,8 +501,9 @@ function Generate-TailoredRestoreScript {
         $null = $sb.AppendLine("======================================================================================")
         $null = $sb.AppendLine("#>")
         $null = $sb.AppendLine("")
-        $null = $sb.AppendLine('[Console]::OutputEncoding = [System.Text.Encoding]::UTF8')
         $null = $sb.AppendLine('param([switch]$NonInteractive)')
+        $null = $sb.AppendLine('')
+        $null = $sb.AppendLine('[Console]::OutputEncoding = [System.Text.Encoding]::UTF8')
         $null = $sb.AppendLine('$Host.UI.RawUI.WindowTitle = "Windows 底层优化状态无损精准还原大师 (Pre-State Restorer)"')
         $null = $sb.AppendLine('$isAdmin = ($env:UGO_SKIP_ADMIN_CHECK -eq ''1'') -or (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))')
         $null = $sb.AppendLine('if (-not $isAdmin) {')
@@ -658,13 +739,35 @@ function Generate-TailoredRestoreScript {
             }
             $null = $sb.AppendLine('Print-Success "已将物理网卡硬件高级属性与 TCP/UDP 协议栈全部精准还原！"')
         }
-        if ($snap.Network.GlobalTcp) {
-            $gt = $snap.Network.GlobalTcp
-            if ($gt['Receive-Side Scaling State']) { $null = $sb.AppendLine("netsh int tcp set global rss=$($gt['Receive-Side Scaling State']) 2>`$null | Out-Null") }
-            if ($gt['Receive Window Auto-Tuning Level']) { $null = $sb.AppendLine("netsh int tcp set global autotuninglevel=$($gt['Receive Window Auto-Tuning Level']) 2>`$null | Out-Null") }
-            if ($gt['ECN Capability']) { $null = $sb.AppendLine("netsh int tcp set global ecncapability=$($gt['ECN Capability']) 2>`$null | Out-Null") }
-            if ($gt['RFC 1323 Timestamps']) { $null = $sb.AppendLine("netsh int tcp set global timestamps=$($gt['RFC 1323 Timestamps']) 2>`$null | Out-Null") }
+        # 还原网卡 Class 驱动级参数 (Bug 9)
+        if ($snap.Network.NicClassSettings) {
+            foreach ($item in $snap.Network.NicClassSettings) {
+                if ($item.Path -and $item.Values) {
+                    foreach ($kv in $item.Values.GetEnumerator()) {
+                        $vStr = if ($null -ne $kv.Value) { "'$($kv.Value)'" } else { "`$null" }
+                        $null = $sb.AppendLine("Restore-RegValue '$($item.Path)' '$($kv.Key)' $vStr 'String'")
+                    }
+                }
+            }
         }
+
+        # 还原全局 TCP 参数 (中英文双向兼容与 CanonicalTcp 支持 Bug 5)
+        $rssVal = if ($snap.Network.CanonicalTcp -and $snap.Network.CanonicalTcp.rss) { $snap.Network.CanonicalTcp.rss } else {
+            if ($snap.Network.GlobalTcp) { $snap.Network.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'Receive-Side|接收.*缩放' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        $atVal = if ($snap.Network.CanonicalTcp -and $snap.Network.CanonicalTcp.autotuninglevel) { $snap.Network.CanonicalTcp.autotuninglevel } else {
+            if ($snap.Network.GlobalTcp) { $snap.Network.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'Auto-Tuning|自动调节' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        $ecnVal = if ($snap.Network.CanonicalTcp -and $snap.Network.CanonicalTcp.ecncapability) { $snap.Network.CanonicalTcp.ecncapability } else {
+            if ($snap.Network.GlobalTcp) { $snap.Network.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'ECN' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        $tsVal = if ($snap.Network.CanonicalTcp -and $snap.Network.CanonicalTcp.timestamps) { $snap.Network.CanonicalTcp.timestamps } else {
+            if ($snap.Network.GlobalTcp) { $snap.Network.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'Timestamp|时间戳' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        if ($rssVal) { $null = $sb.AppendLine("netsh int tcp set global rss=$rssVal 2>`$null | Out-Null") }
+        if ($atVal) { $null = $sb.AppendLine("netsh int tcp set global autotuninglevel=$atVal 2>`$null | Out-Null") }
+        if ($ecnVal) { $null = $sb.AppendLine("netsh int tcp set global ecncapability=$ecnVal 2>`$null | Out-Null") }
+        if ($tsVal) { $null = $sb.AppendLine("netsh int tcp set global timestamps=$tsVal 2>`$null | Out-Null") }
         $null = $sb.AppendLine('')
 
         # 9. 输入设备与 USB
@@ -782,11 +885,19 @@ function Generate-TailoredRestoreScript {
 
         $tailoredScript = $sb.ToString()
         $restorePs1Path = Join-Path $optDir "Restore-PreOptimizationState.ps1"
+        $factoryBackup = Join-Path $optDir "Restore-PreOptimizationState-Factory.ps1"
+        if ((Test-Path $restorePs1Path) -and (-not (Test-Path $factoryBackup))) {
+            Copy-Item -Path $restorePs1Path -Destination $factoryBackup -Force -ErrorAction SilentlyContinue
+        }
+
         $utf8Bom = [System.Text.UTF8Encoding]::new($true)
         [System.IO.File]::WriteAllText($restorePs1Path, $tailoredScript, $utf8Bom)
 
         $progDataDir = "$env:ProgramData\UniversalGameOptimizer"
         if (-not (Test-Path $progDataDir)) { New-Item -ItemType Directory -Path $progDataDir -Force | Out-Null }
+        if (-not (Test-Path "$progDataDir\Restore-PreOptimizationState-Factory.ps1") -and (Test-Path $factoryBackup)) {
+            Copy-Item -Path $factoryBackup -Destination "$progDataDir\Restore-PreOptimizationState-Factory.ps1" -Force -ErrorAction SilentlyContinue
+        }
         [System.IO.File]::WriteAllText("$progDataDir\Restore-PreOptimizationState.ps1", $tailoredScript, $utf8Bom)
 
         Print-Success "已根据当前电脑硬件扫描结果与本次自选决策【专属动态生成】还原脚本：[Restore-PreOptimizationState.ps1]"
@@ -1251,9 +1362,12 @@ function Invoke-AdaptiveHardwareScan {
         if ($name -match "NVIDIA|GeForce|RTX|GTX") {
             $isDiscrete = $true
             try {
-                $nvsmiOut = & nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>$null
-                if ($nvsmiOut -match "(\d+)\s*MiB") {
-                    $vramGB = [Math]::Round([int]$matches[1] / 1024, 1)
+                $nvsmi = Get-NvidiaSmiPath
+                if ($nvsmi) {
+                    $nvsmiOut = & $nvsmi --query-gpu=name,memory.total --format=csv,noheader 2>$null
+                    if ($nvsmiOut -match "(\d+)\s*MiB") {
+                        $vramGB = [Math]::Round([int]$matches[1] / 1024, 1)
+                    }
                 }
             } catch {}
         }
@@ -1334,6 +1448,10 @@ $global:CpuTuningRoute = 1
 # 科学负压瞬态轮询验证机制 (CoreCycler 架构模式)
 # =========================================================================
 function Test-CoreCyclerTransientStability {
+    param(
+        [switch]$DeepMode,
+        [int]$CustomPulses = 0
+    )
     Write-Host "`n======================================================================================" -ForegroundColor Cyan
     Write-Host "   ★ CPU CURVE OPTIMIZER 单核瞬态轮询验证大师 (CoreCycler 架构规范) ★   " -ForegroundColor Yellow
     Write-Host "  【原理】：Win32 API 单核逐一锁定 + 密集浮点冲刺 + 瞬间撤载负压瞬态冲击 + WHEA-18 监控" -ForegroundColor Green
@@ -1360,9 +1478,9 @@ function Test-CoreCyclerTransientStability {
     }
 
     $totalCores = $coresToTest.Count
-    Write-Host " [*] 待测核心拓扑: 检测到 $totalCores 个核心算力单元，准备进入逐核瞬态轮询..." -ForegroundColor Cyan
-
-    $pulsesPerCore = 3      # 每个核心执行 3 次高载冲刺/骤停撤载循环
+    $pulsesPerCore = if ($CustomPulses -gt 0) { $CustomPulses } elseif ($DeepMode) { 10 } else { 3 }
+    $modeDesc = if ($pulsesPerCore -ge 10) { "深度压测模式 ($pulsesPerCore 轮脉冲/核心)" } else { "快速瞬态自检模式 ($pulsesPerCore 轮脉冲/核心，耗时约 2~3 分钟)" }
+    Write-Host " [*] 待测核心拓扑: 检测到 $totalCores 个核心算力单元，准备进入逐核瞬态轮询 [$modeDesc]..." -ForegroundColor Cyan
     $burstSec = 2.5         # 每次冲刺 2.5 秒
     $idleSec = 1.0          # 每次撤载急停 1.0 秒
     $failedCores = [System.Collections.Generic.List[string]]::new()
@@ -1457,6 +1575,7 @@ function Test-CoreCyclerTransientStability {
         } -ErrorAction SilentlyContinue
     } catch {}
 
+    Write-Host "--------------------------------------------------------------------------------------`n" -ForegroundColor DarkGray
     if ($failedCores.Count -eq 0 -and (-not $allWhea -or $allWhea.Count -eq 0)) {
         Write-Host "  * 硬件健康状态诊断: [ 100% 完美通过 · 零错误 · 零 WHEA-18 告警 ]" -ForegroundColor Green
         Write-Host "  * 结论建议: 当前 CPU 负压与供电策略极其坚挺，已具备扛过日常突发负荷与游戏激烈交火的黄金稳定性！" -ForegroundColor Green
@@ -1469,26 +1588,26 @@ function Test-CoreCyclerTransientStability {
         Write-Host "  * 优化处置建议: 请在 AMD Curve Optimizer 中为上述异常核心回调 3~5 档电压 (Counts)，切勿盲目激进负压！" -ForegroundColor Yellow
         return $false
     }
-    Write-Host "--------------------------------------------------------------------------------------`n" -ForegroundColor DarkGray
 }
 
 function Request-HardwareTuningPrompt {
     Write-Host "`n======================================================================================" -ForegroundColor Green
-    Write-Host "        ★ 系统底层 1~13 大核心性能优化项：已就绪并全部集成自动执行 ★        " -ForegroundColor Green
+    Write-Host "        ★ 系统底层 1~14 大核心性能优化项：已就绪并全部集成自动执行 ★        " -ForegroundColor Green
     Write-Host "======================================================================================" -ForegroundColor Green
     Write-Host "  [√] 1. 电源与 CPU Unpark：解锁【卓越性能 (Ultimate)】，核心停驻 100% 解禁，关闭链路休眠" -ForegroundColor White
     Write-Host "  [√] 2. 内核隔离与 VBS：彻底关闭 HVCI 内存完整性与虚拟化沙盒，释放 CPU 裸金属算力" -ForegroundColor White
-    Write-Host "  [√] 3. 硬件消息中断：独显与物理网卡开启 MSI 硬件中断并锁定 High 优先级" -ForegroundColor White
-    Write-Host "  [√] 4. 高精稳定时钟：锁定 0.5ms~1ms 全局高精度时钟，斩断微秒级跳帧微卡顿" -ForegroundColor White
-    Write-Host "  [√] 5. 内存与弹性分页：内核驻留物理内存 (DPE=1)，双驱弹性虚拟内存防 OOM 并保 Dump" -ForegroundColor White
-    Write-Host "  [√] 6. NTFS 存储减负：关闭访问时间戳与 8.3 短文件名，现代 NVMe 固态规范维护" -ForegroundColor White
-    Write-Host "  [√] 7. 网络协议解耦：解除网络节流放行 UDP 竞技微包，网卡自适应抗中断风暴调谐" -ForegroundColor White
-    Write-Host "  [√] 8. 原生输入响应：关闭指针加速度 1:1 响应，封杀键盘粘滞与 USB 休眠断流" -ForegroundColor White
-    Write-Host "  [√] 9. 渲染与合成通道：HAGS 硬件加速与 Win11 MPO DirectFlip 极速直翻层" -ForegroundColor White
-    Write-Host "  [√] 10. 音频调度置顶：MMCSS 游戏与音频任务置顶，开火音画毫秒同步零爆音" -ForegroundColor White
-    Write-Host "  [√] 11. 独显直连拓扑：台式机/直连本全局独显；混合笔记本定向游戏注入，保护桌面续航" -ForegroundColor White
-    Write-Host "  [√] 12. 封杀节能节流：封杀 Windows EcoQoS 节能节流，保留 SysMain 维持原生内存压缩" -ForegroundColor White
-    Write-Host "  [√] 13. 自适应看门狗：硬件级 CPU 拓扑识别，游戏独占算力，电竞与 4K/8K 外设驱动免疫降级" -ForegroundColor White
+    Write-Host "  [√] 3. Windows Defender 策略优化：消除实时引擎扫描中断，释放全核高频计算资源" -ForegroundColor White
+    Write-Host "  [√] 4. 硬件消息中断：独显与物理网卡开启 MSI 硬件中断并锁定 High 优先级" -ForegroundColor White
+    Write-Host "  [√] 5. 高精稳定时钟：锁定 0.5ms~1ms 全局高精度时钟，斩断微秒级跳帧微卡顿与 DPC 延迟" -ForegroundColor White
+    Write-Host "  [√] 6. 处理器供电能效：注入硬件自适应 EPP 参数，彻底解禁核心停驻与动态加速" -ForegroundColor White
+    Write-Host "  [√] 7. 内存与弹性分页：内核驻留物理内存 (DPE=1)，双驱弹性虚拟内存防 OOM 并保 Dump" -ForegroundColor White
+    Write-Host "  [√] 8. NTFS 存储减负：关闭访问时间戳与 8.3 短文件名，现代 NVMe 固态规范维护" -ForegroundColor White
+    Write-Host "  [√] 9. 网络协议解耦：解除网络节流放行 UDP 竞技微包，网卡自适应抗中断风暴调谐" -ForegroundColor White
+    Write-Host "  [√] 10. 原生输入响应：关闭指针加速度 1:1 响应，封杀键盘粘滞与 USB 休眠断流" -ForegroundColor White
+    Write-Host "  [√] 11. 渲染与合成通道：HAGS 硬件加速与 Win11 MPO DirectFlip 极速直翻层及 MMCSS 置顶" -ForegroundColor White
+    Write-Host "  [√] 12. 独显直连拓扑：台式机/直连本全局独显；混合笔记本定向游戏注入，保护桌面续航" -ForegroundColor White
+    Write-Host "  [√] 13. 封杀节能节流：封杀 Windows EcoQoS 节能节流，保留 SysMain 维持原生内存压缩" -ForegroundColor White
+    Write-Host "  [√] 14. 自适应看门狗：硬件级 CPU 拓扑识别，游戏独占算力，电竞与 4K/8K 外设驱动免疫降级" -ForegroundColor White
     Write-Host "--------------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "   请确认以下两个个性化选项 (直接按回车均应用【推荐方案】：纯系统级安全优化+保留杀毒)" -ForegroundColor Yellow
     Write-Host "--------------------------------------------------------------------------------------" -ForegroundColor DarkGray
@@ -1498,7 +1617,7 @@ function Request-HardwareTuningPrompt {
     Write-Host "    [1] 开启 (启动 30 秒 CPU 深度热阻探测，计算参数后并在最后执行 CPU+GPU 极限双烤高压复核)" -ForegroundColor White
     Write-Host "        * 核心收益: 自动分析散热体质，台式机水冷激进释放性能，笔记本切除高压过热区稳住 1% Low" -ForegroundColor Gray
     Write-Host "        * 安全保障: 自动生成桌面【一键还原优化前所有系统与硬件状态.bat】，随时 100% 精准无损复原" -ForegroundColor Gray
-    Write-Host "    [2] 跳过 (默认推荐: 执行系统底层 1~13 大核心优化项，100% 纯系统级安全，不触碰芯片电压)" -ForegroundColor Green
+    Write-Host "    [2] 跳过 (默认推荐: 执行系统底层 1~14 大核心优化项，100% 纯系统级安全，不触碰芯片电压)" -ForegroundColor Green
     Write-Host "--------------------------------------------------------------------------------------" -ForegroundColor DarkGray
     if ($NonInteractive -or $env:UGO_NON_INTERACTIVE -eq '1') {
         $choice = if ($HwChoice) { $HwChoice } elseif ($env:UGO_HW_CHOICE) { $env:UGO_HW_CHOICE } else { "2" }
@@ -1568,8 +1687,8 @@ function Invoke-DynamicHardwareTuning {
         Print-Info "机型形态诊断：当前检测为 [$formFactor]"
 
         # 2. 初始基准温度探测 (NVIDIA GPU 实时驱动级传感器)
-        $nvsmi = "C:\Windows\system32\nvidia-smi.exe"
-        $hasNvidia = (Test-Path $nvsmi) -and ($global:SysInfo.GpuVendor -eq "NVIDIA")
+        $nvsmi = Get-NvidiaSmiPath
+        $hasNvidia = ($null -ne $nvsmi) -and ($global:SysInfo.GpuVendor -eq "NVIDIA")
         $initGpuTemp = $null
         if ($hasNvidia) {
             $tempQuery = & $nvsmi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>$null
@@ -2189,6 +2308,7 @@ public static class NativeGpuBurner {
                 $hwBootCmd = "$hwDir\HardwareBootApply.cmd"
                 $bootLines = @(
                     "@echo off",
+                    "@chcp 65001 >nul",
                     ":: Universal Game Optimizer - Boot Hardware Tuning Auto Re-apply",
                     ":: 保持 GPU Boost 原生动态加速与桌面低功耗待机，避免全局锁频导致待机积热",
                     "timeout /t 10 /nobreak >nul"
@@ -2221,7 +2341,8 @@ public static class NativeGpuBurner {
                 $bootLines += "powercfg -setactive scheme_current >nul 2>&1"
 
                 $bootContent = $bootLines -join "`r`n"
-                [System.IO.File]::WriteAllText($hwBootCmd, $bootContent, [System.Text.Encoding]::UTF8)
+                $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                [System.IO.File]::WriteAllText($hwBootCmd, $bootContent, $utf8NoBom)
 
                 # 注册 Windows 计划任务：开机登录即静默后台执行，最高管理员权限，无黑框弹窗
                 $taskName = "UniversalGameOptimizer_HardwareStartup"
@@ -2389,9 +2510,9 @@ function Optimize-MSIInterruptMode {
         try { $topo = [GameOptimizer.NativeCpuTopology]::Probe() } catch {}
 
         # 检查是否满足 IRQ 亲和性分流的拓扑前置条件 (至少 5 个物理核心，或至少 6 个逻辑处理器且存在 Core 2 和 Core 4)
-        $canAffinity = ($null -ne $topo -and $topo.Cores.Count -ge 5 -and $topo.LogicalProcessorCount -ge 6)
-        $core2Mask = if ($canAffinity) { [int64]$topo.Cores[2].AffinityMask } else { 0L }
-        $core4Mask = if ($canAffinity) { [int64]$topo.Cores[4].AffinityMask } else { 0L }
+        $canAffinity = ($null -ne $topo -and $topo.Cores -and $topo.Cores.Count -ge 5 -and $topo.LogicalProcessorCount -ge 6)
+        $core2Mask = if ($canAffinity -and $topo.Cores.Count -gt 2 -and $topo.Cores[2].AffinityMask) { [int64]$topo.Cores[2].AffinityMask } else { 0L }
+        $core4Mask = if ($canAffinity -and $topo.Cores.Count -gt 4 -and $topo.Cores[4].AffinityMask) { [int64]$topo.Cores[4].AffinityMask } else { 0L }
 
         # 获取网络适配器列表，以备 RSS 状态与 PnP 匹配
         $allAdapters = @()
@@ -2468,10 +2589,14 @@ function Optimize-MSIInterruptMode {
                             if ($hasMultiQueueRss) {
                                 Print-Info "网卡 [$nicName] 已启用硬件多队列 RSS，由 MSI-X 动态管理多向量分流，跳过单核亲和性绑定以防中断冲突！"
                             } else {
-                                Set-ItemProperty -Path $affinityKey -Name "DevicePolicy" -Value 4 -Type DWord -Force # IrqPolicySpecifiedProcessors
-                                [byte[]]$bytes = [BitConverter]::GetBytes($core2Mask)
-                                Set-ItemProperty -Path $affinityKey -Name "AssignmentSetOverride" -Value $bytes -Type Binary -Force
-                                Print-Success "【IRQ 亲和性已绑定】已将物理网卡 [$nicName] 硬件中断精准解耦绑定至物理 Core 2 (掩码: 0x$($core2Mask.ToString('X')))，彻底移出 CPU 0！"
+                                if ($core2Mask -le 0L) {
+                                    Print-Warn "物理 Core 2 亲和性掩码无效 (0x0)，跳过网卡 [$nicName] IRQ 亲和性绑定以防中断丢失！"
+                                } else {
+                                    Set-ItemProperty -Path $affinityKey -Name "DevicePolicy" -Value 4 -Type DWord -Force # IrqPolicySpecifiedProcessors
+                                    [byte[]]$bytes = [BitConverter]::GetBytes($core2Mask)
+                                    Set-ItemProperty -Path $affinityKey -Name "AssignmentSetOverride" -Value $bytes -Type Binary -Force
+                                    Print-Success "【IRQ 亲和性已绑定】已将物理网卡 [$nicName] 硬件中断精准解耦绑定至物理 Core 2 (掩码: 0x$($core2Mask.ToString('X')))，彻底移出 CPU 0！"
+                                }
                             }
                         }
 
@@ -2484,10 +2609,14 @@ function Optimize-MSIInterruptMode {
                             }
 
                             if ($isTargetGpu) {
-                                Set-ItemProperty -Path $affinityKey -Name "DevicePolicy" -Value 4 -Type DWord -Force # IrqPolicySpecifiedProcessors
-                                [byte[]]$bytes = [BitConverter]::GetBytes($core4Mask)
-                                Set-ItemProperty -Path $affinityKey -Name "AssignmentSetOverride" -Value $bytes -Type Binary -Force
-                                Print-Success "【IRQ 亲和性已绑定】已将主力显卡 [$cleanGpuDesc] 渲染中断精准解耦绑定至物理 Core 4 (掩码: 0x$($core4Mask.ToString('X')))，彻底移出 CPU 0！"
+                                if ($core4Mask -le 0L) {
+                                    Print-Warn "物理 Core 4 亲和性掩码无效 (0x0)，跳过显卡 [$cleanGpuDesc] IRQ 亲和性绑定以防中断丢失！"
+                                } else {
+                                    Set-ItemProperty -Path $affinityKey -Name "DevicePolicy" -Value 4 -Type DWord -Force # IrqPolicySpecifiedProcessors
+                                    [byte[]]$bytes = [BitConverter]::GetBytes($core4Mask)
+                                    Set-ItemProperty -Path $affinityKey -Name "AssignmentSetOverride" -Value $bytes -Type Binary -Force
+                                    Print-Success "【IRQ 亲和性已绑定】已将主力显卡 [$cleanGpuDesc] 渲染中断精准解耦绑定至物理 Core 4 (掩码: 0x$($core4Mask.ToString('X')))，彻底移出 CPU 0！"
+                                }
                             }
                         }
                     }
@@ -2569,8 +2698,8 @@ function Optimize-CpuAndPowerPlan {
         # 锁死硬盘、PCIe 通道省电与 USB 选择性暂停
         powercfg -setacvalueindex scheme_current sub_disk diskidle 0 | Out-Null
         powercfg -setacvalueindex scheme_current sub_pciexpress ASPM 0 | Out-Null
-        powercfg -setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07d226 0 | Out-Null # USB选择性暂停关闭
-        powercfg -setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07d226 0 | Out-Null
+        powercfg -setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 | Out-Null # USB选择性暂停关闭
+        powercfg -setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 | Out-Null
         powercfg -setactive scheme_current | Out-Null
         Print-Success "硬件通道深度锁定：固态休眠=从不、PCIe节能=关闭(ASPM=0)、USB选择性暂停=关闭(防鼠标丢帧)"
 
@@ -3089,12 +3218,21 @@ function Deploy-AdaptiveUniversalWatchdog {
     "ds4windows", "steam", "steamwebhelper", "antimicrox", "joy2key", "x360ce", "rewasd"
 ) | ForEach-Object { [void]`$gamingEcosystemSet.Add(`$_) }
 
-# 2. 全盘主流游戏平台安装目录特征库 (命中即自动识别为游戏)
+# 2. 全盘主流游戏平台安装目录特征库 (排除泛化路径，防止非游戏程序被误提权)
 `$gamePathPatterns = @(
     "\steamapps\common\", "\epic games\", "\riot games\", "\ubisoft",
     "\origin games\", "\ea games\", "\wegame", "\rail_apps\",
-    "\gog galaxy\games\", "\xboxgames\", "\games\", "\game\", "\binaries\win64\"
+    "\gog galaxy\games\", "\xboxgames\", "\genshin impact", "\star rail", "\netease"
 )
+
+# 游戏配套辅助程序黑名单 (严禁识别为游戏主体，防止常驻 High 优先级)
+`$gameHelperBlacklist = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+@(
+    "crashreportclient", "crashpad_handler", "unrealcefsubprocess", "steamwebhelper", "epicwebhelper",
+    "riotclientservices", "easyanticheat", "easyanticheat_eos", "battleye", "update", "updater",
+    "installer", "setup", "launcher", "unitycrashhandler64", "unitycrashhandler32", "cefprocess",
+    "gamelauncher", "overlay", "gameoverlayui"
+) | ForEach-Object { [void]`$gameHelperBlacklist.Add(`$_) }
 
 # 3. 内置高频电竞与热门 3A 瞬时热索引表 (秒级命中冷启动)
 `$fastGameIndex = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -3144,6 +3282,10 @@ while (`$true) {
         if (`$sysProtectSet.Contains(`$pname)) { continue }
 
         `$isGame = `$false
+        if (`$gameHelperBlacklist.Contains(`$pname)) {
+            continue
+        }
+
         if (`$fastGameIndex.Contains(`$pname) -or `$autoGames.Contains(`$pname)) {
             `$isGame = `$true
         } else {
@@ -3173,8 +3315,8 @@ while (`$true) {
         }
     }
 
-    # 第二阶段：核心反向独占隔离机制 (仅在存在核心异构划分时执行：混合大小核隔离至 E 核，或 AMD 双 CCD 隔离至 CCD1)
-    if (`$currentlyRunningGame -and -not `$isIsolated -and (`$otherAffinity -ne `$allCoresMask)) {
+    # 第二阶段：核心反向独占持续隔离机制 (持续巡检新起进程，持续隔离至 E 核/CCD1)
+    if (`$currentlyRunningGame -and (`$otherAffinity -ne `$allCoresMask)) {
         `$isIsolated = `$true
         foreach (`$proc in Get-Process) {
             `$pname = `$proc.ProcessName

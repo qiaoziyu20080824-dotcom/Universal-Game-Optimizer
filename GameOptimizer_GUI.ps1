@@ -243,18 +243,53 @@ namespace GameOptimizer {
 }
 
 
-# 管理员权限自检与自提权
+# 管理员权限自检与自提权 (完整透传命令行参数)
 $isAdmin = ($env:UGO_SKIP_ADMIN_CHECK -eq '1') -or (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
 if (-not $isAdmin) {
     try {
         $guiScript = if ($PSScriptRoot) { Join-Path $PSScriptRoot "GameOptimizer_GUI.ps1" } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { Join-Path (Get-Location).Path "GameOptimizer_GUI.ps1" }
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$guiScript`"" -Verb RunAs
+        $forwardArgs = @()
+        if ($Optimize) { $forwardArgs += "-Optimize" }
+        if ($Restore) { $forwardArgs += "-Restore" }
+        if ($ResetClocks) { $forwardArgs += "-ResetClocks" }
+        if ($CoreCycler) { $forwardArgs += "-CoreCycler" }
+        if ($Help) { $forwardArgs += "-Help" }
+        if ($args) { $forwardArgs += ($args -join ' ') }
+        $argSuffix = if ($forwardArgs.Count -gt 0) { " " + ($forwardArgs -join ' ') } else { "" }
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$guiScript`"$argSuffix" -Verb RunAs
         exit
     } catch {}
 }
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } elseif ([System.AppDomain]::CurrentDomain.BaseDirectory) { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') } else { (Get-Location).Path }
 if (-not $scriptDir -or -not (Test-Path $scriptDir)) { $scriptDir = (Get-Location).Path }
+
+# 全局可靠探测 nvidia-smi 路径
+function Get-NvidiaSmiPath {
+    $cmd = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    $cmd2 = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+    if ($cmd2 -and (Test-Path $cmd2.Source)) { return $cmd2.Source }
+    $candidates = @(
+        "$env:SystemRoot\System32\nvidia-smi.exe",
+        "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        "$env:SystemDrive\Windows\System32\nvidia-smi.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    $driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
+    if (Test-Path $driverStore) {
+        $nvsmiInStore = Get-ChildItem -Path $driverStore -Filter "nvidia-smi.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($nvsmiInStore) { return $nvsmiInStore.FullName }
+    }
+    return $null
+}
+
+# 状态刷新别名兼容防呆
+function Update-HardwareAndStatusDisplay {
+    Update-SystemBaselineUI
+}
 
 # =========================================================================
 # XAML 视觉界面定义 (Dark Cyberpunk / Glassmorphic Gaming UI)
@@ -377,7 +412,7 @@ $xaml = @"
             <!-- Left: Core System Items Checklist -->
             <Border Grid.Column="0" Background="#161B22" BorderBrush="#30363D" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,6,0">
                 <StackPanel>
-                    <TextBlock Text="⚙️ 系统底层 1~13 大优化项 (全自动执行清单)" FontSize="13" FontWeight="Bold" Foreground="#58A6FF" Margin="0,0,0,8"/>
+                    <TextBlock Text="⚙️ 系统底层 1~14 大核心优化项 (全自动深度执行清单)" FontSize="13" FontWeight="Bold" Foreground="#58A6FF" Margin="0,0,0,8"/>
                     <WrapPanel Orientation="Horizontal">
                         <TextBlock Text="[√] 电源方案卓越锁频" Width="170" FontSize="11" Foreground="#3FB950" Margin="0,2"/>
                         <TextBlock Text="[√] 内核隔离&amp;VBS关闭" Width="170" FontSize="11" Foreground="#3FB950" Margin="0,2"/>
@@ -733,9 +768,12 @@ function Update-SystemBaselineUI {
             if ($name -match "NVIDIA|GeForce|RTX|GTX") {
                 $isDiscrete = $true
                 try {
-                    $nvsmiOut = & nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>$null
-                    if ($nvsmiOut -match "(\d+)\s*MiB") {
-                        $vramGB = [Math]::Round([int]$matches[1] / 1024, 1)
+                    $nvsmi = Get-NvidiaSmiPath
+                    if ($nvsmi) {
+                        $nvsmiOut = & $nvsmi --query-gpu=name,memory.total --format=csv,noheader 2>$null
+                        if ($nvsmiOut -match "(\d+)\s*MiB") {
+                            $vramGB = [Math]::Round([int]$matches[1] / 1024, 1)
+                        }
                     }
                 } catch {}
             }
@@ -879,6 +917,8 @@ Append-Log "====================================================================
 # =========================================================================
 # 异步进程运行器 (保持 WPF 界面零卡顿、丝滑响应)
 # =========================================================================
+$script:CurrentChildProcess = $null
+
 function Invoke-AsyncEngine ($scriptPath, $argList, $actionTitle, $onComplete) {
     $BtnStartOptimize.IsEnabled = $false
     $BtnStartRestore.IsEnabled = $false
@@ -904,8 +944,8 @@ function Invoke-AsyncEngine ($scriptPath, $argList, $actionTitle, $onComplete) {
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
     $proc.EnableRaisingEvents = $true
+    $script:CurrentChildProcess = $proc
 
-    $stepCounter = 10
     $outHandler = [System.Diagnostics.DataReceivedEventHandler]{
         param($sender, $e)
         if ($e.Data) {
@@ -930,13 +970,26 @@ function Invoke-AsyncEngine ($scriptPath, $argList, $actionTitle, $onComplete) {
 
     $proc.add_Exited({
         $window.Dispatcher.Invoke([Action]{
-            $BtnStartOptimize.IsEnabled = $true
-            $BtnStartRestore.IsEnabled = $true
-            $BtnStartCoreCycler.IsEnabled = $true
-            $BtnResetClocks.IsEnabled = $true
-            Set-ProgressUI 100 "$actionTitle 已完成！"
-            Update-SystemBaselineUI
-            if ($onComplete) { & $onComplete }
+            try {
+                $BtnStartOptimize.IsEnabled = $true
+                $BtnStartRestore.IsEnabled = $true
+                $BtnStartCoreCycler.IsEnabled = $true
+                $BtnResetClocks.IsEnabled = $true
+                Set-ProgressUI 100 "$actionTitle 已完成！"
+                Update-SystemBaselineUI
+                if ($onComplete) {
+                    try {
+                        & $onComplete
+                    } catch {
+                        Append-Log "[!] 任务回调执行提示: $_"
+                    }
+                }
+            } finally {
+                if ($script:CurrentChildProcess) {
+                    try { $script:CurrentChildProcess.Dispose() } catch {}
+                    $script:CurrentChildProcess = $null
+                }
+            }
         })
     })
 
@@ -1012,7 +1065,7 @@ $BtnStartOptimize.add_Click({
 
     $argsStr = "-NonInteractive -HwChoice $hwChoice -RouteChoice $routeChoice -DefChoice $defChoice -TargetGpu `"$selectedGpuName`" -EnableDirectGpu $enableDirectChoice -EnableIrqAffinity $irqChoice -EnableCoreCycler $coreCyclerChoice"
     Invoke-AsyncEngine $coreScript $argsStr "全维自适应底层深度优化" {
-        Update-HardwareAndStatusDisplay
+        Update-SystemBaselineUI
         [System.Windows.MessageBox]::Show("★ 全维底层深度优化已全部完成！`n`n[√] 目标显卡 [$selectedGpuName] 已完成独显直连与图形渲染管线锁定`n[√] 桌面与工具目录已同步编译生成专属还原脚本与批处理`n[√] 若启用了芯片调谐已建立开机自动静默生效任务`n`n强烈建议在方便时【重启电脑】，以便内核隔离关闭与硬件中断在固件层完整生效！", "优化就绪", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
     }
 })
@@ -1024,7 +1077,7 @@ $BtnStartCoreCycler.add_Click({
                "本测试借鉴开源超频神器 CoreCycler 的验证逻辑：`n" +
                "利用 Windows 原生 API 将算力单独锁定在单核上轮询执行高低交替突发与骤停撤载，" +
                "配合读取系统事件日志 (Windows Event Log) 中是否产生了 WHEA-Logger Event 18 警告。`n`n" +
-               "本测试需要耗时 30~60 分钟，期间制造单核瞬态交替突发撤载以检验低压稳定性，可能发生黑屏重启，请先保存所有未完成的工作！`n`n" +
+               "快速瞬态核验模式耗时约 2~3 分钟（亦可连续循环核验）。期间制造单核瞬态交替突发撤载以检验低压稳定性，可能引起瞬时卡顿或偶发重启，请先保存所有未完成的工作！`n`n" +
                "确定现在开始运行 CoreCycler 瞬态单核轮询测试吗？"
     $res = [System.Windows.MessageBox]::Show($warnMsg, "CoreCycler 瞬态压力测试警告", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
     if ($res -ne [System.Windows.MessageBoxResult]::Yes) { return }
@@ -1055,23 +1108,55 @@ $BtnStartRestore.add_Click({
 
     Invoke-AsyncEngine $restoreScript "-NonInteractive" "100% 精准无损系统还原" {
         Remove-Item "$env:ProgramData\UniversalGameOptimizer\OptimizationCompleted.flag" -Force -ErrorAction SilentlyContinue
-        Update-HardwareAndStatusDisplay
+        Update-SystemBaselineUI
         [System.Windows.MessageBox]::Show("★ 系统状态已 100% 精准还原至优化前原貌！`n`n[√] 所有开机自启调谐任务已注销清除`n[√] 自适应看门狗已彻底终止退出`n[√] 原生电源方案、网络与外设习惯已全量复原`n`n建议在方便时【重启电脑】使固件与中断配置彻底重载！", "还原成功", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
     }
 })
 
-# 3. 恢复出厂默认频率
+# 3. 恢复出厂默认频率与功耗墙
 $BtnResetClocks.add_Click({
-    $res = [System.Windows.MessageBox]::Show("确定要立即重置显卡与处理器至官方出厂默认频率，并注销开机自启调谐吗？", "重置频率", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+    $res = [System.Windows.MessageBox]::Show("确定要立即重置显卡与处理器至官方出厂默认频率/功耗墙，并注销开机自启调谐吗？", "重置频率", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
     if ($res -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
     Append-Log "`r`n>>> 正在恢复 CPU/GPU 官方出厂频率基准并清除自启动..."
     try {
-        $nvsmi = "nvidia-smi"
-        & $nvsmi -rgc 2>$null | Out-Null
-        & $nvsmi -rmc 2>$null | Out-Null
-        Append-Log " [√] NVIDIA 显卡核心与显存频率已释放至出厂动态调度！"
-    } catch {}
+        $nvsmi = Get-NvidiaSmiPath
+        if ($nvsmi) {
+            & $nvsmi -rgc 2>$null | Out-Null
+            & $nvsmi -rmc 2>$null | Out-Null
+            Append-Log " [√] NVIDIA 显卡核心与显存频率已释放至出厂动态调度！"
+
+            # 恢复 GPU 出厂/快照功耗墙
+            $defPl = $null
+            try {
+                $plQuery = & $nvsmi --query-gpu=power.default_limit --format=csv,noheader,nounits 2>$null
+                if ($plQuery -match '(\d+(?:\.\d+)?)') {
+                    $defPl = [int][Math]::Round([double]$matches[1])
+                }
+            } catch {}
+
+            if (-not $defPl -or $defPl -le 30) {
+                $snapFile = "$env:ProgramData\UniversalGameOptimizer\PreOptimizationState.baseline.json"
+                if (-not (Test-Path $snapFile)) { $snapFile = "$env:ProgramData\UniversalGameOptimizer\PreOptimizationState.json" }
+                if (-not (Test-Path $snapFile)) { $snapFile = Join-Path $scriptDir "PreOptimizationState.json" }
+                if (Test-Path $snapFile) {
+                    try {
+                        $snapObj = Get-Content -LiteralPath $snapFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                        if ($snapObj.HardwareTuning -and $snapObj.HardwareTuning.GpuPowerLimitW -and [int]$snapObj.HardwareTuning.GpuPowerLimitW -gt 30) {
+                            $defPl = [int]$snapObj.HardwareTuning.GpuPowerLimitW
+                        }
+                    } catch {}
+                }
+            }
+
+            if ($defPl -and $defPl -gt 30) {
+                & $nvsmi -pl $defPl 2>$null | Out-Null
+                Append-Log " [√] NVIDIA 显卡功率墙已精准还原至出厂/快照基准: [$defPl W]！"
+            }
+        }
+    } catch {
+        Append-Log " [!] 恢复显卡频率提示: $_"
+    }
 
     try {
         $binDir = Join-Path $scriptDir "bin"
@@ -1086,16 +1171,29 @@ $BtnResetClocks.add_Click({
     } catch {}
 
     try {
-        powercfg -setacvalueindex scheme_current sub_processor PERFEPP 50 2>$null | Out-Null
+        $origEpp = 50
+        $snapFile = "$env:ProgramData\UniversalGameOptimizer\PreOptimizationState.baseline.json"
+        if (-not (Test-Path $snapFile)) { $snapFile = "$env:ProgramData\UniversalGameOptimizer\PreOptimizationState.json" }
+        if (-not (Test-Path $snapFile)) { $snapFile = Join-Path $scriptDir "PreOptimizationState.json" }
+        if (Test-Path $snapFile) {
+            try {
+                $snapObj = Get-Content -LiteralPath $snapFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($snapObj.Power -and $null -ne $snapObj.Power.PerfEpp) {
+                    $origEpp = [int]$snapObj.Power.PerfEpp
+                }
+            } catch {}
+        }
+        powercfg -setacvalueindex scheme_current sub_processor PERFEPP $origEpp 2>$null | Out-Null
         powercfg -setactive scheme_current 2>$null | Out-Null
-        Append-Log " [√] 处理器供电能效 (PERFEPP) 已恢复默认基准 (50)！"
+        Append-Log " [√] 处理器供电能效 (PERFEPP) 已恢复基准 ($origEpp)！"
     } catch {}
 
     schtasks /delete /tn "UniversalGameOptimizer_HardwareStartup" /f 2>$null | Out-Null
     Remove-Item "$env:ProgramData\UniversalGameOptimizer\HardwareBootApply.cmd" -Force -ErrorAction SilentlyContinue | Out-Null
     Append-Log " [√] 已清除开机自动调谐计划任务与引导脚本！"
     Set-ProgressUI 100 "出厂默认频率已复原！"
-    [System.Windows.MessageBox]::Show("CPU 与 GPU 已全部恢复官方出厂默认频率状态！", "完成", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+    Update-SystemBaselineUI
+    [System.Windows.MessageBox]::Show("CPU 与 GPU 已全部恢复官方出厂默认频率与功耗状态！", "完成", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
 })
 
 # 4. 打开原理手册 (支持 docx、txt、md 及系统无 Office 时的自动降级记事本打开)

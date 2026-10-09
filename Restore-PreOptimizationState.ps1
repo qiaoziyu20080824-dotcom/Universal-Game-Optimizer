@@ -41,6 +41,28 @@ function Print-Warn ($msg) {
     Write-Host "  [! 还原提示] $msg" -ForegroundColor Magenta
 }
 
+# 全局可靠探测 nvidia-smi 路径
+function Get-NvidiaSmiPath {
+    $cmd = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    $cmd2 = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+    if ($cmd2 -and (Test-Path $cmd2.Source)) { return $cmd2.Source }
+    $candidates = @(
+        "$env:SystemRoot\System32\nvidia-smi.exe",
+        "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        "$env:SystemDrive\Windows\System32\nvidia-smi.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    $driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
+    if (Test-Path $driverStore) {
+        $nvsmiInStore = Get-ChildItem -Path $driverStore -Filter "nvidia-smi.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($nvsmiInStore) { return $nvsmiInStore.FullName }
+    }
+    return $null
+}
+
 function Restore-RegValue ($path, $name, $val, $type = "DWord") {
     try {
         if ($null -eq $val) {
@@ -54,20 +76,26 @@ function Restore-RegValue ($path, $name, $val, $type = "DWord") {
     } catch {}
 }
 
-# 1. 定位并读取优化前状态快照清单
-$stateFile = "$env:ProgramData\UniversalGameOptimizer\PreOptimizationState.json"
-if (-not (Test-Path $stateFile)) {
-    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } elseif ([System.AppDomain]::CurrentDomain.BaseDirectory) { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') } else { (Get-Location).Path }
-    $stateFile = Join-Path $scriptDir "PreOptimizationState.json"
-}
+# 1. 定位并读取优化前状态快照清单 (优先初始纯净基准快照)
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } elseif ([System.AppDomain]::CurrentDomain.BaseDirectory) { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') } else { (Get-Location).Path }
+$candidateFiles = @(
+    "$env:ProgramData\UniversalGameOptimizer\PreOptimizationState.baseline.json",
+    (Join-Path $scriptDir "PreOptimizationState.baseline.json"),
+    "$env:ProgramData\UniversalGameOptimizer\PreOptimizationState.json",
+    (Join-Path $scriptDir "PreOptimizationState.json")
+)
+$stateFile = $candidateFiles | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if (-not (Test-Path $stateFile)) {
     Write-Host "`n [!] 警告：未在系统找到优化前快照清单 [PreOptimizationState.json]！" -ForegroundColor Red
     Write-Host "     将执行安全兜底还原流程 (重置 CPU/GPU 频率、清除计划任务、还原关键默认调度)..." -ForegroundColor Yellow
     
     # 兜底恢复
-    & nvidia-smi -rgc 2>$null | Out-Null
-    & nvidia-smi -rmc 2>$null | Out-Null
+    $nvsmi = Get-NvidiaSmiPath
+    if ($nvsmi) {
+        & $nvsmi -rgc 2>$null | Out-Null
+        & $nvsmi -rmc 2>$null | Out-Null
+    }
     $rAdj = Join-Path $PSScriptRoot "bin\ryzenadj.exe"
     if (-not (Test-Path $rAdj)) { $rAdj = "$env:ProgramData\UniversalGameOptimizer\bin\ryzenadj.exe" }
     if (Test-Path $rAdj) { & $rAdj --set-coall=0 2>$null | Out-Null }
@@ -103,8 +131,11 @@ try {
 if ($state.PSObject.Properties['ComputerName'] -and $state.ComputerName -and ($state.ComputerName -ne $env:COMPUTERNAME)) {
     Write-Host "`n [!] 提示：检测到快照由计算机 [$($state.ComputerName)] 生成，与当前电脑 [$env:COMPUTERNAME] 不一致！" -ForegroundColor Magenta
     Write-Host "     为防止不同主板与驱动产生硬件冲突，跳过针对性快照恢复，转为执行通用安全兜底还原流程..." -ForegroundColor Yellow
-    & nvidia-smi -rgc 2>$null | Out-Null
-    & nvidia-smi -rmc 2>$null | Out-Null
+    $nvsmi = Get-NvidiaSmiPath
+    if ($nvsmi) {
+        & $nvsmi -rgc 2>$null | Out-Null
+        & $nvsmi -rmc 2>$null | Out-Null
+    }
     $rAdj = Join-Path $PSScriptRoot "bin\ryzenadj.exe"
     if (-not (Test-Path $rAdj)) { $rAdj = "$env:ProgramData\UniversalGameOptimizer\bin\ryzenadj.exe" }
     if (Test-Path $rAdj) { & $rAdj --set-coall=0 2>$null | Out-Null }
@@ -127,12 +158,15 @@ if ($state.PSObject.Properties['ComputerName'] -and $state.ComputerName -and ($s
 # =========================================================================
 Print-Step "1/10" "还原 CPU 与 GPU 芯片频率、电压与功耗至优化前基准"
 try {
-    & nvidia-smi -rgc 2>$null | Out-Null
-    & nvidia-smi -rmc 2>$null | Out-Null
-    # 还原优化前快照记录的 GPU 功耗上限 (功耗墙)，避免 -pl 修改后残留
-    if ($state.HardwareTuning -and $null -ne $state.HardwareTuning.GpuPowerLimitW -and [int]$state.HardwareTuning.GpuPowerLimitW -gt 30) {
-        & nvidia-smi -pl ([int]$state.HardwareTuning.GpuPowerLimitW) 2>$null | Out-Null
-        Print-Success "已还原 GPU 功耗上限至优化前基准: [$([int]$state.HardwareTuning.GpuPowerLimitW) W]"
+    $nvsmi = Get-NvidiaSmiPath
+    if ($nvsmi) {
+        & $nvsmi -rgc 2>$null | Out-Null
+        & $nvsmi -rmc 2>$null | Out-Null
+        # 还原优化前快照记录的 GPU 功耗上限 (功耗墙)，避免 -pl 修改后残留
+        if ($state.HardwareTuning -and $null -ne $state.HardwareTuning.GpuPowerLimitW -and [int]$state.HardwareTuning.GpuPowerLimitW -gt 30) {
+            & $nvsmi -pl ([int]$state.HardwareTuning.GpuPowerLimitW) 2>$null | Out-Null
+            Print-Success "已还原 GPU 功耗上限至优化前基准: [$([int]$state.HardwareTuning.GpuPowerLimitW) W]"
+        }
     }
     $ryzenAdjPath = Join-Path $PSScriptRoot "bin\ryzenadj.exe"
     if (-not (Test-Path $ryzenAdjPath)) { $ryzenAdjPath = "$env:ProgramData\UniversalGameOptimizer\bin\ryzenadj.exe" }
@@ -389,13 +423,35 @@ try {
             }
             Print-Success "已将物理网卡硬件高级属性与 TCP/UDP 协议栈全部精准还原至优化前状态！"
         }
-        if ($net.GlobalTcp) {
-            $gt = $net.GlobalTcp
-            if ($gt['Receive-Side Scaling State']) { netsh int tcp set global rss=$($gt['Receive-Side Scaling State']) 2>$null | Out-Null }
-            if ($gt['Receive Window Auto-Tuning Level']) { netsh int tcp set global autotuninglevel=$($gt['Receive Window Auto-Tuning Level']) 2>$null | Out-Null }
-            if ($gt['ECN Capability']) { netsh int tcp set global ecncapability=$($gt['ECN Capability']) 2>$null | Out-Null }
-            if ($gt['RFC 1323 Timestamps']) { netsh int tcp set global timestamps=$($gt['RFC 1323 Timestamps']) 2>$null | Out-Null }
+        # 还原网卡 Class 驱动级参数 (Bug 9)
+        if ($net.NicClassSettings) {
+            foreach ($item in $net.NicClassSettings) {
+                if ($item.Path -and $item.Values) {
+                    foreach ($kv in $item.Values.GetEnumerator()) {
+                        Restore-RegValue $item.Path $kv.Key $kv.Value "String"
+                    }
+                }
+            }
+            Print-Success "已将物理网卡驱动级 Class 注册表高级配置全部精准还原！"
         }
+
+        # 还原全局 TCP 参数 (中英文双向兼容与 CanonicalTcp 支持 Bug 5)
+        $rssVal = if ($net.CanonicalTcp -and $net.CanonicalTcp.rss) { $net.CanonicalTcp.rss } else {
+            if ($net.GlobalTcp) { $net.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'Receive-Side|接收.*缩放' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        $atVal = if ($net.CanonicalTcp -and $net.CanonicalTcp.autotuninglevel) { $net.CanonicalTcp.autotuninglevel } else {
+            if ($net.GlobalTcp) { $net.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'Auto-Tuning|自动调节' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        $ecnVal = if ($net.CanonicalTcp -and $net.CanonicalTcp.ecncapability) { $net.CanonicalTcp.ecncapability } else {
+            if ($net.GlobalTcp) { $net.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'ECN' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        $tsVal = if ($net.CanonicalTcp -and $net.CanonicalTcp.timestamps) { $net.CanonicalTcp.timestamps } else {
+            if ($net.GlobalTcp) { $net.GlobalTcp.GetEnumerator() | Where-Object { $_.Key -match 'Timestamp|时间戳' } | Select-Object -ExpandProperty Value -First 1 } else { $null }
+        }
+        if ($rssVal) { netsh int tcp set global rss=$rssVal 2>$null | Out-Null }
+        if ($atVal) { netsh int tcp set global autotuninglevel=$atVal 2>$null | Out-Null }
+        if ($ecnVal) { netsh int tcp set global ecncapability=$ecnVal 2>$null | Out-Null }
+        if ($tsVal) { netsh int tcp set global timestamps=$tsVal 2>$null | Out-Null }
     }
 } catch {
     Print-Warn "网络属性还原提示: $_"
