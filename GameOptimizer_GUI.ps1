@@ -14,6 +14,7 @@
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+[System.Windows.Media.RenderOptions]::ProcessRenderMode = [System.Windows.Interop.RenderMode]::SoftwareOnly
 
 # =========================================================================
 # Win32 原生 CPU 拓扑与 P/E 核心硬件级探测引擎 (替代简陋字符串推导)
@@ -235,6 +236,57 @@ namespace GameOptimizer {
                 if (buffer != IntPtr.Zero) {
                     Marshal.FreeHGlobal(buffer);
                 }
+            }
+        }
+    }
+}
+'@
+}
+
+if (-not ([System.Management.Automation.PSTypeName]'GameOptimizer.ProcessOutputWatcher').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Collections.Concurrent;
+
+namespace GameOptimizer {
+    public class ProcessOutputWatcher : IDisposable {
+        private Process _proc;
+        public ConcurrentQueue<string> OutputQueue = new ConcurrentQueue<string>();
+        public volatile bool HasExited = false;
+        public int ExitCode = 0;
+
+        public bool Start(Process proc) {
+            _proc = proc;
+            _proc.OutputDataReceived += (s, e) => {
+                if (e.Data != null) OutputQueue.Enqueue(e.Data);
+            };
+            _proc.ErrorDataReceived += (s, e) => {
+                if (e.Data != null) OutputQueue.Enqueue(e.Data);
+            };
+            _proc.EnableRaisingEvents = true;
+            _proc.Exited += (s, e) => {
+                try { ExitCode = _proc.ExitCode; } catch {}
+                HasExited = true;
+            };
+            bool started = _proc.Start();
+            if (started) {
+                _proc.BeginOutputReadLine();
+                _proc.BeginErrorReadLine();
+            }
+            return started;
+        }
+
+        public void Kill() {
+            if (_proc != null && !HasExited) {
+                try { _proc.Kill(); } catch {}
+            }
+        }
+
+        public void Dispose() {
+            if (_proc != null) {
+                try { _proc.Dispose(); } catch {}
+                _proc = null;
             }
         }
     }
@@ -675,20 +727,32 @@ $ChkEnableCoreCycler.add_Checked({
     }
 })
 
-# 日志输出函数
+# 日志输出函数 (带 Dispatcher CheckAccess 线程安全守卫)
 function Append-Log ($msg) {
-    $window.Dispatcher.Invoke([Action]{
+    if (-not $TxtConsoleLog) { return }
+    $action = [Action]{
         $TxtConsoleLog.AppendText("$msg`r`n")
-        $LogScrollViewer.ScrollToEnd()
-    })
+        if ($LogScrollViewer) { $LogScrollViewer.ScrollToEnd() }
+    }
+    if ($window -and $window.Dispatcher -and -not $window.Dispatcher.CheckAccess()) {
+        $window.Dispatcher.Invoke($action)
+    } else {
+        & $action
+    }
 }
 
 function Set-ProgressUI ($pct, $text) {
-    $window.Dispatcher.Invoke([Action]{
+    if (-not $MainProgressBar) { return }
+    $action = [Action]{
         $MainProgressBar.Value = $pct
         $TxtProgressPct.Text = "$pct%"
         $TxtProgressStatus.Text = $text
-    })
+    }
+    if ($window -and $window.Dispatcher -and -not $window.Dispatcher.CheckAccess()) {
+        $window.Dispatcher.Invoke($action)
+    } else {
+        & $action
+    }
 }
 
 # =========================================================================
@@ -915,9 +979,10 @@ Append-Log "  4. 确认无误后，点击绿色按钮【🚀 开始运行全维�
 Append-Log "======================================================================================"
 
 # =========================================================================
-# 异步进程运行器 (保持 WPF 界面零卡顿、丝滑响应)
+# 异步进程运行器 (原生 C# 高性能无锁队列 + WPF DispatcherTimer，彻底根除跨线程闪退)
 # =========================================================================
-$script:CurrentChildProcess = $null
+$script:CurrentChildWatcher = $null
+$script:CurrentDispatchTimer = $null
 
 function Invoke-AsyncEngine ($scriptPath, $argList, $actionTitle, $onComplete) {
     $BtnStartOptimize.IsEnabled = $false
@@ -943,40 +1008,53 @@ function Invoke-AsyncEngine ($scriptPath, $argList, $actionTitle, $onComplete) {
 
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
-    $proc.EnableRaisingEvents = $true
-    $script:CurrentChildProcess = $proc
 
-    $outHandler = [System.Diagnostics.DataReceivedEventHandler]{
-        param($sender, $e)
-        if ($e.Data) {
-            $line = $e.Data
-            Append-Log $line
+    $watcher = New-Object GameOptimizer.ProcessOutputWatcher
+    $script:CurrentChildWatcher = $watcher
 
-            if ($line -match ">>> \[(\d+)/(\d+)\]") {
-                $curr = [int]$matches[1]
-                $total = [int]$matches[2]
-                $calcPct = [int][Math]::Min(95, [Math]::Max(10, ($curr / $total) * 90))
-                Set-ProgressUI $calcPct "正在执行: $line"
-            } elseif ($line -match "严苛高压复核|二次复核|压力测试") {
-                Set-ProgressUI 45 "正在执行芯片饱和压力测试与温升采样..."
-            } elseif ($line -match "全量系统状态精准无损还原完成|WINDOWS 全维自适应底层优化完成") {
-                Set-ProgressUI 100 "任务执行完毕！"
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(40)
+    $script:CurrentDispatchTimer = $timer
+
+    $timer.add_Tick({
+        # 1. 批量安全消费后台 C# 队列中的所有日志输出 (直接在 UI 线程执行，绝对零跨线程崩溃风险)
+        $line = $null
+        while ($watcher.OutputQueue.TryDequeue([ref]$line)) {
+            if ($line) {
+                Append-Log $line
+
+                if ($line -match ">>> \[(\d+)/(\d+)\]") {
+                    $curr = [int]$matches[1]
+                    $total = [int]$matches[2]
+                    $calcPct = [int][Math]::Min(95, [Math]::Max(10, ($curr / $total) * 90))
+                    Set-ProgressUI $calcPct "正在执行: $line"
+                } elseif ($line -match "严苛高压复核|二次复核|压力测试") {
+                    Set-ProgressUI 45 "正在执行芯片饱和压力测试与温升采样..."
+                } elseif ($line -match "全量系统状态精准无损还原完成|WINDOWS 全维自适应底层优化完成") {
+                    Set-ProgressUI 100 "任务执行完毕！"
+                }
             }
         }
-    }
 
-    $proc.add_OutputDataReceived($outHandler)
-    $proc.add_ErrorDataReceived($outHandler)
+        # 2. 检查子进程是否已结束
+        if ($watcher.HasExited -and $watcher.OutputQueue.IsEmpty) {
+            $timer.Stop()
+            $script:CurrentDispatchTimer = $null
+            $script:CurrentChildWatcher = $null
 
-    $proc.add_Exited({
-        $window.Dispatcher.Invoke([Action]{
             try {
                 $BtnStartOptimize.IsEnabled = $true
                 $BtnStartRestore.IsEnabled = $true
                 $BtnStartCoreCycler.IsEnabled = $true
                 $BtnResetClocks.IsEnabled = $true
-                Set-ProgressUI 100 "$actionTitle 已完成！"
+
+                if ($watcher.ExitCode -eq 0) {
+                    Set-ProgressUI 100 "$actionTitle 已完成！"
+                } else {
+                    Set-ProgressUI 100 "$actionTitle 执行结束 (退出码: $($watcher.ExitCode))"
+                }
                 Update-SystemBaselineUI
+
                 if ($onComplete) {
                     try {
                         & $onComplete
@@ -985,17 +1063,24 @@ function Invoke-AsyncEngine ($scriptPath, $argList, $actionTitle, $onComplete) {
                     }
                 }
             } finally {
-                if ($script:CurrentChildProcess) {
-                    try { $script:CurrentChildProcess.Dispose() } catch {}
-                    $script:CurrentChildProcess = $null
-                }
+                $watcher.Dispose()
             }
-        })
+        }
     })
 
-    [void]$proc.Start()
-    $proc.BeginOutputReadLine()
-    $proc.BeginErrorReadLine()
+    try {
+        if (-not $watcher.Start($proc)) {
+            throw "无法启动底层引擎进程: $scriptPath"
+        }
+        $timer.Start()
+    } catch {
+        Append-Log "[!] 引擎启动异常: $_"
+        $BtnStartOptimize.IsEnabled = $true
+        $BtnStartRestore.IsEnabled = $true
+        $BtnStartCoreCycler.IsEnabled = $true
+        $BtnResetClocks.IsEnabled = $true
+        Set-ProgressUI 0 "启动失败"
+    }
 }
 
 # =========================================================================
@@ -1264,6 +1349,29 @@ $window.add_Loaded({
         $BtnResetClocks.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
     } elseif ($CoreCycler) {
         $BtnStartCoreCycler.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    }
+})
+
+# 窗口异常守卫与关闭清理
+$window.Dispatcher.add_UnhandledException({
+    param($sender, $e)
+    try {
+        $e.Handled = $true
+        Append-Log "[!] 界面调度器拦截未处理异常: $($e.Exception.Message)"
+    } catch {}
+})
+
+$window.add_Closing({
+    if ($script:CurrentDispatchTimer) {
+        try { $script:CurrentDispatchTimer.Stop() } catch {}
+        $script:CurrentDispatchTimer = $null
+    }
+    if ($script:CurrentChildWatcher) {
+        try {
+            $script:CurrentChildWatcher.Kill()
+            $script:CurrentChildWatcher.Dispose()
+        } catch {}
+        $script:CurrentChildWatcher = $null
     }
 })
 
