@@ -8,5 +8,6 @@ Desktop.ini
 
 # Machine-specific pre-optimization state snapshot
 PreOptimizationState*.json
+OptimizationResult*.json
 *.flag
 

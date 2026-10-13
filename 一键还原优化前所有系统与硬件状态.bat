@@ -22,6 +22,10 @@ if exist "%~dp0Restore-PreOptimizationState.ps1" (
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Restore-PreOptimizationState.ps1"
 ) else if exist "%ProgramData%\UniversalGameOptimizer\Restore-PreOptimizationState.ps1" (
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ProgramData%\UniversalGameOptimizer\Restore-PreOptimizationState.ps1"
+) else if exist "%~dp0Restore-PreOptimizationState-Factory.ps1" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Restore-PreOptimizationState-Factory.ps1"
+) else if exist "%ProgramData%\UniversalGameOptimizer\Restore-PreOptimizationState-Factory.ps1" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ProgramData%\UniversalGameOptimizer\Restore-PreOptimizationState-Factory.ps1"
 ) else if exist "%~dp0Universal_Game_Optimizer_GUI\Restore-PreOptimizationState.ps1" (
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Universal_Game_Optimizer_GUI\Restore-PreOptimizationState.ps1"
 ) else (
@@ -34,3 +38,4 @@ if exist "%~dp0Restore-PreOptimizationState.ps1" (
 echo.
 echo 还原流程结束。按任意键关闭此窗口...
 pause >nul
+
